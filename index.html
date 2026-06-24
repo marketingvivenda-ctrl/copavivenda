@@ -1171,19 +1171,36 @@ td input:focus{background:rgba(255,198,0,.12);}
 <!-- ========================= TAB: DESAFIOS (teaser para atendentes) ========================= -->
 <div class="section" id="tab-desafios">
   <div class="sec-head">
-    <div><div class="sec-title">⚡ Desafios Especiais</div>
-    <div class="sec-sub">Surpresas ao longo da competição</div></div>
+    <div><div class="sec-title">⚡ Desafios</div>
+    <div class="sec-sub">O desafio que está valendo agora — e mais por vir</div></div>
   </div>
-  <div class="teaser-wrap">
-    <div class="teaser-card">
-      <div class="teaser-emoji">🎁</div>
-      <div class="teaser-title">Em breve…</div>
-      <div class="teaser-text">Desafios-surpresa vão aparecer ao longo da Copa Vivenda 2026, podendo valer <strong>pontos extras</strong> a qualquer momento. Fique atento — quando menos esperar, vale ponto! 👀</div>
+
+  <!-- DESAFIO ATIVO -->
+  <div style="max-width:680px;margin:6px auto 0;background:linear-gradient(160deg,rgba(76,175,125,.16),rgba(0,0,0,.25));border:1px solid rgba(76,175,125,.45);border-radius:16px;padding:26px 24px;">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+      <span class="de-extra" style="background:#4caf7d;color:#0a3d25;">🟢 DESAFIO ATIVO</span>
+      <span style="font-family:'Oswald',sans-serif;font-size:13px;color:#7dd4a8;letter-spacing:.5px;">📅 24/06 a 31/06</span>
     </div>
-    <div class="teaser-row">
-      <div class="teaser-mini"><div class="teaser-emoji">🔒</div><div>Aguarde</div></div>
-      <div class="teaser-mini"><div class="teaser-emoji">⚡</div><div>Surpresa</div></div>
-      <div class="teaser-mini"><div class="teaser-emoji">🏆</div><div>Pontos extras</div></div>
+    <div style="font-family:'Oswald',sans-serif;font-size:24px;font-weight:700;color:var(--amarelo);letter-spacing:.5px;margin-bottom:6px;">Produto Turbo: Loção Corporal 💧</div>
+    <div style="font-size:14px;color:var(--creme);line-height:1.6;margin-bottom:16px;">Esta semana é a <strong>Loção Corporal Hidratante</strong> que vale ponto extra! Quanto mais você vender, mais pontos ganha — começando já a partir de <strong>2 unidades</strong>. Todo mundo pontua, e quem vender mais vira o <strong>destaque da virada</strong>. 🚀</div>
+    <table class="criterio-table">
+      <tbody><tr><th>Loções vendidas na semana</th><th>Pontos extras</th></tr>
+      <tr><td>2 unidades</td><td><span class="pts-badge">+2</span></td></tr>
+      <tr><td>3 a 4</td><td><span class="pts-badge">+4</span></td></tr>
+      <tr><td>5 a 7</td><td><span class="pts-badge">+8</span></td></tr>
+      <tr><td>8 a 11</td><td><span class="pts-badge">+10</span></td></tr>
+      <tr><td>12 a 15</td><td><span class="pts-badge">+12</span></td></tr>
+      <tr><td>16 a 20</td><td><span class="pts-badge">+15</span></td></tr>
+      <tr><td>21 ou mais</td><td><span class="pts-badge">+18</span></td></tr>
+    </tbody></table>
+  </div>
+
+  <!-- PRÓXIMOS (surpresa) -->
+  <div class="teaser-wrap" style="margin-top:22px;">
+    <div class="teaser-card" style="padding:26px 24px;">
+      <div class="teaser-emoji">🎁</div>
+      <div class="teaser-title" style="font-size:20px;">Mais desafios vêm aí…</div>
+      <div class="teaser-text">Outros desafios-surpresa vão aparecer ao longo da Copa Vivenda 2026, podendo valer pontos extras a qualquer momento. Fique atento — quando menos esperar, vale ponto! 👀</div>
     </div>
   </div>
 </div>
@@ -1332,34 +1349,25 @@ td input:focus{background:rgba(255,198,0,.12);}
     </div>
   </div>
 
-  <!-- ===== TABELA DE AVALIAÇÃO — DESAFIOS EXTRAS (Ponto 4) ===== -->
+  <!-- ===== TABELA DE AVALIAÇÃO — DESAFIO ATIVO ===== -->
   <div style="margin-top:28px;">
     <div class="tbl-bar" style="border-radius:8px 8px 0 0;background:rgba(0,0,0,.3);border:1px solid rgba(255,198,0,.18);border-bottom:none;">
-      <div class="tbl-bar-left"><span class="tbl-bar-title">🎯 Tabela de Avaliação — Desafios Extras &amp; Bônus</span></div>
+      <div class="tbl-bar-left"><span class="tbl-bar-title">🎯 Desafio Ativo — como pontua</span></div>
     </div>
     <div style="background:rgba(0,0,0,.18);border:1px solid rgba(255,198,0,.18);border-radius:0 0 8px 8px;padding:0 0 4px;">
       <div style="font-size:11px;color:var(--cinza-texto);padding:10px 14px 6px;">
-        Referência de todos os bônus dos desafios. Os valores conquistados aqui devem ser lançados na coluna
-        <strong style="color:#7dd4a8">Bônus</strong> dos colaboradores (individual) ou no <strong style="color:#7dd4a8">Bônus Coletivo</strong> da Liga Geral (coletivo).
+        O bônus do desafio da semana é lançado na coluna <strong style="color:#7dd4a8">Bônus</strong> do colaborador.
+        Novos desafios são revelados ao longo da competição.
       </div>
       <table class="de-table">
         <thead><tr>
-          <th style="width:90px">Semana</th>
+          <th style="width:110px">Período</th>
           <th>Desafio</th>
-          <th style="width:90px">Alvo</th>
-          <th>Resultado</th>
+          <th>Como pontua</th>
           <th style="width:90px">Bônus</th>
         </tr></thead>
         <tbody>
-          <tr><td class="de-sem">Semana 1</td><td>Primeira Virada <span class="de-extra">EXTRA</span></td><td><span class="de-tag tag-ind">Individual</span></td><td>Superação da própria média (1ª vez)</td><td><span class="pts-badge">+3</span></td></tr>
-          <tr><td class="de-sem">Semana 1</td><td>Carga Máxima</td><td><span class="de-tag tag-col">Coletivo</span></td><td>1 / 3 / 5 dias consecutivos de meta</td><td><span class="pts-badge">+2 / +5 / +10</span></td></tr>
-          <tr><td class="de-sem">Semana 2</td><td>Meta Relâmpago</td><td><span class="de-tag tag-ind">Individual</span></td><td>Meta relâmpago / melhor desempenho</td><td><span class="pts-badge">+5 / +10</span></td></tr>
-          <tr><td class="de-sem">Semana 3</td><td>Produto Turbo <span class="de-extra">EXTRA</span></td><td><span class="de-tag tag-ind">Individual</span></td><td>Maior vendedor / maior crescimento</td><td><span class="pts-badge">+10 / +10</span></td></tr>
-          <tr><td class="de-sem">Semana 3</td><td>Produto Turbo <span class="de-extra">EXTRA</span></td><td><span class="de-tag tag-col">Coletivo</span></td><td>Loja destaque</td><td><span class="pts-badge">+5</span></td></tr>
-          <tr><td class="de-sem">Semana 4</td><td>Sprint Google <span class="de-extra">EXTRA</span></td><td><span class="de-tag tag-col">Coletivo</span></td><td>Meta atingida / loja destaque</td><td><span class="pts-badge">+5 / +10</span></td></tr>
-          <tr><td class="de-sem">Semana 5</td><td>Meta Consecutiva Turbo</td><td><span class="de-tag tag-col">Coletivo</span></td><td>1 / 3 / 5 dias (5 ativa Turbo Final)</td><td><span class="pts-badge">+2 / +5 / +10</span></td></tr>
-          <tr><td class="de-sem">Semana 5</td><td>Última Virada <span class="de-extra">EXTRA</span></td><td><span class="de-tag tag-ind">Individual</span></td><td>Maior subida individual no ranking</td><td><span class="pts-badge">+10</span></td></tr>
-          <tr><td class="de-sem">Semana 5</td><td>Última Virada <span class="de-extra">EXTRA</span></td><td><span class="de-tag tag-col">Coletivo</span></td><td>Maior subida coletiva no ranking</td><td><span class="pts-badge">+15</span></td></tr>
+          <tr><td class="de-sem">24/06 a 31/06</td><td>Produto Turbo: Loção <span class="de-extra">ATIVO</span></td><td>Por quantidade de loções vendidas na semana (a partir de 2 un.)</td><td><span class="pts-badge">+2 até +18</span></td></tr>
         </tbody>
       </table>
     </div>
