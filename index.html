@@ -459,6 +459,7 @@ td input:focus{background:rgba(255,198,0,.12);}
 .criterio-block{background:rgba(0,0,0,.25);border:1px solid rgba(255,198,0,.15);border-radius:6px;padding:14px 18px;margin-bottom:14px;}
 .criterio-title{font-family:'Oswald',sans-serif;font-size:13px;font-weight:600;color:var(--amarelo);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;}
 .criterio-table{width:100%;border-collapse:collapse;font-size:12px;}
+.desafio-card{overflow:hidden;}
 .criterio-table th{background:rgba(0,0,0,.3);color:var(--cinza-texto);font-size:11px;padding:6px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,.08);}
 .criterio-table td{padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.04);color:var(--creme);}
 .criterio-table tr:last-child td{border-bottom:none;}
@@ -591,6 +592,9 @@ td.cell-live input{color:var(--amarelo)!important;font-weight:700!important;font
   td.td-left input{min-width:124px;}
   .unidade-sel{font-size:12px;min-width:104px;max-width:none;}
   .de-table,.duplas-table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;white-space:nowrap;}
+  /* tabelas dentro de cards de critério/desafio podem quebrar linha (não vazam do card) */
+  .criterio-table{white-space:normal;table-layout:fixed;width:100%;}
+  .criterio-table th,.criterio-table td{padding:6px 7px;word-break:break-word;}
   /* Selo e aviso menos intrusivos no celular */
   .status-badge{font-size:10px;padding:6px 10px;bottom:12px;left:12px;gap:5px;}
   .toast{bottom:12px;right:12px;font-size:12px;padding:9px 14px;}
@@ -1109,7 +1113,7 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
   </div>
 
   <!-- DESAFIO ATIVO -->
-  <div style="max-width:680px;margin:6px auto 0;background:linear-gradient(160deg,rgba(255,198,0,.16),rgba(0,0,0,.25));border:1px solid rgba(255,198,0,.5);border-radius:16px;padding:26px 24px;">
+  <div class="desafio-card" style="max-width:680px;margin:6px auto 0;background:linear-gradient(160deg,rgba(255,198,0,.16),rgba(0,0,0,.25));border:1px solid rgba(255,198,0,.5);border-radius:16px;padding:26px 24px;">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
       <span class="de-extra" style="background:#4caf7d;color:#0a3d25;">🟢 DESAFIO ATIVO</span>
       <span style="font-family:'Oswald',sans-serif;font-size:13px;color:#7dd4a8;letter-spacing:.5px;">📅 20/07 a 27/07</span>
@@ -1128,7 +1132,7 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
       <tr><td>14 a 16</td><td><span class="pts-badge">+4</span></td><td><span class="pts-badge">+20</span></td></tr>
       <tr><td>17 a 19</td><td><span class="pts-badge">+4,5</span></td><td><span class="pts-badge">+25</span></td></tr>
       <tr><td>20 ou mais</td><td><span class="pts-badge">+5</span></td><td><span class="pts-badge">+30</span></td></tr>
-      <tr><td>🏆 Unidade com mais avaliações da rede</td><td><span class="pts-badge">+1 extra</span></td><td><span class="pts-badge">+10 extra</span></td></tr>
+      <tr><td>🏆 Mais avaliações da rede</td><td><span class="pts-badge">+1 extra</span></td><td><span class="pts-badge">+10 extra</span></td></tr>
     </tbody></table>
     <div style="font-size:12px;color:#a9d8bd;margin-top:12px;background:rgba(76,175,125,.1);border-left:3px solid #4caf7d;border-radius:0 6px 6px 0;padding:8px 12px;">
       💡 Vale avaliação feita na loja <strong>e online</strong> — então toda unidade pode correr atrás. Peça para quem você atendeu bem: cliente satisfeito adora ajudar!
@@ -1136,7 +1140,7 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
   </div>
 
   <!-- DESAFIO CONCLUÍDO -->
-  <div style="max-width:680px;margin:20px auto 0;background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:22px 24px;opacity:.92;">
+  <div class="desafio-card" style="max-width:680px;margin:20px auto 0;background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:22px 24px;opacity:.92;">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
       <span class="de-extra" style="background:rgba(255,255,255,.15);color:var(--cinza-texto);">✓ CONCLUÍDO</span>
       <span style="font-family:'Oswald',sans-serif;font-size:13px;color:var(--cinza-texto);letter-spacing:.5px;">📅 24/06 a 31/06</span>
