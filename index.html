@@ -1,363 +1,5 @@
 <!DOCTYPE html>
 <html lang="pt-BR"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures (htmlToImage undefined) and toPng errors
-            // so the parent always gets a response instead of hanging forever.
-            try {
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Copa Vivenda 2026</title>
@@ -553,6 +195,10 @@ td.cell-apurado{background:rgba(76,175,125,.07);}
 td.cell-apurado input{color:#9cc9ac!important;}
 td.cell-live{background:rgba(255,198,0,.07);}
 td.cell-live input{color:var(--amarelo)!important;font-weight:700!important;font-family:'Oswald',sans-serif;font-size:14px;}
+td.cell-bonus{background:rgba(76,175,125,.08);}
+td.cell-bonus input{color:#7dd4a8!important;}
+.th-apurado-col{color:var(--creme)!important;}
+.th-bonus-col{color:#7dd4a8!important;background:rgba(76,175,125,.12)!important;}
 .apurada-note{background:rgba(76,175,125,.1);border-left:3px solid #4caf7d;border-radius:0 6px 6px 0;padding:8px 12px;font-size:11px;color:#a9d8bd;margin:0 0 12px;}
 /* Teaser de desafios (página dos atendentes) */
 .teaser-wrap{max-width:640px;margin:10px auto 0;}
@@ -581,8 +227,8 @@ td.cell-live input{color:var(--amarelo)!important;font-weight:700!important;font
   /* As tabelas grandes (Comercial/Laboratório) recebem largura mínima fixa
      e rolam dentro do próprio container, evitando o cálculo errado no 1º carregamento */
   #comercial-body, #lab-body{ }
-  #tab-comercial table{min-width:560px;display:table;}
-  #tab-lab table{min-width:560px;display:table;}
+  #tab-comercial table{min-width:680px;display:table;}
+  #tab-lab table{min-width:680px;display:table;}
   #tab-geral table{min-width:440px;display:table;}
   #tab-comercial .tbl-wrap, #tab-lab .tbl-wrap, #tab-geral .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
   thead th{padding:8px 9px;font-size:10px;}
@@ -608,7 +254,7 @@ td.cell-live input{color:var(--amarelo)!important;font-weight:700!important;font
 
 </style>
 </head>
-<body id="artifacts-component-root-html">
+<body>
 
 <div class="header">
   <div class="header-inner">
@@ -652,8 +298,8 @@ td.cell-live input{color:var(--amarelo)!important;font-weight:700!important;font
   </div>
 
   <div class="nota-liga">
-A <strong>Liga Geral</strong> disputa as <strong>7 unidades</strong> em julho: o total de cada uma é a <strong>soma dos pontos</strong> de todos os seus colaboradores (Comercial + Laboratório), mais o <strong>Bônus Coletivo</strong> dos desafios.
-    Cada unidade conta <strong>apenas o seu próprio laboratório</strong> (Sobradinho e Val 1, sem laboratório, concorrem só com o comercial).
+A <strong>Liga Geral</strong> disputa as <strong>7 unidades</strong>. <strong>COM</strong> e <strong>LAB</strong> somam o total dos colaboradores (critérios + bônus); a coluna <strong style="color:#7dd4a8">Bônus</strong> é para bônus <strong>coletivos</strong> lançados por unidade.
+    Neste momento, cada unidade conta <strong>apenas o seu próprio laboratório</strong> (Sobradinho e Val 1, sem laboratório, concorrem só com o comercial).
   </div>
 
   <div class="tbl-wrap">
@@ -672,47 +318,47 @@ A <strong>Liga Geral</strong> disputa as <strong>7 unidades</strong> em julho: o
       </tr></thead>
       <tbody id="geral-body"><tr class="zona-acesso">
       <td><span class="pos pos-1">1</span></td>
-      <td class="td-left"><strong>Val 2</strong></td>
-      <td class="ro-cell sub-com">191.53</td>
-      <td class="ro-cell sub-lab">433.68</td>
-      <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Val 2']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">625.21</td></tr><tr class="zona-acesso">
-      <td><span class="pos pos-2">2</span></td>
       <td class="td-left"><strong>Planaltina</strong></td>
-      <td class="ro-cell sub-com">205.46</td>
-      <td class="ro-cell sub-lab">393.86</td>
+      <td class="ro-cell sub-com">331.7</td>
+      <td class="ro-cell sub-lab">643.5</td>
       <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Planaltina']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">599.32</td></tr><tr class="zona-acesso">
+      <td class="geral-total">975.2</td></tr><tr class="zona-acesso">
+      <td><span class="pos pos-2">2</span></td>
+      <td class="td-left"><strong>Val 2</strong></td>
+      <td class="ro-cell sub-com">312.84</td>
+      <td class="ro-cell sub-lab">623.31</td>
+      <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Val 2']=+this.value;renderGeral();salvarAuto()"></td>
+      <td class="geral-total">936.15</td></tr><tr class="zona-acesso">
       <td><span class="pos pos-3">3</span></td>
       <td class="td-left"><strong>Asa Sul</strong></td>
-      <td class="ro-cell sub-com">153.26</td>
-      <td class="ro-cell sub-lab">438.75</td>
+      <td class="ro-cell sub-com">238.15</td>
+      <td class="ro-cell sub-lab">697.48</td>
       <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Asa Sul']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">592.01</td></tr><tr class="">
+      <td class="geral-total">935.63</td></tr><tr class="">
       <td><span class="pos pos-n">4</span></td>
-      <td class="td-left"><strong>Taguatinga</strong></td>
-      <td class="ro-cell sub-com">223.88</td>
-      <td class="ro-cell sub-lab">130.05</td>
-      <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Taguatinga']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">353.93</td></tr><tr class="">
-      <td><span class="pos pos-n">5</span></td>
       <td class="td-left"><strong>Ceilândia</strong></td>
-      <td class="ro-cell sub-com">179.02</td>
-      <td class="ro-cell sub-lab">168.89</td>
+      <td class="ro-cell sub-com">308.93</td>
+      <td class="ro-cell sub-lab">261.9</td>
       <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Ceilândia']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">347.91</td></tr><tr class="zona-rebaixamento">
+      <td class="geral-total">570.83</td></tr><tr class="">
+      <td><span class="pos pos-n">5</span></td>
+      <td class="td-left"><strong>Taguatinga</strong></td>
+      <td class="ro-cell sub-com">362.42</td>
+      <td class="ro-cell sub-lab">180.05</td>
+      <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Taguatinga']=+this.value;renderGeral();salvarAuto()"></td>
+      <td class="geral-total">542.47</td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">6</span></td>
       <td class="td-left"><strong>Val 1</strong></td>
-      <td class="ro-cell sub-com">344.24</td>
+      <td class="ro-cell sub-com">501.87</td>
       <td class="ro-cell sub-lab">0</td>
       <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Val 1']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">344.24</td></tr><tr class="zona-rebaixamento">
+      <td class="geral-total">501.87</td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">7</span></td>
       <td class="td-left"><strong>Sobradinho</strong></td>
-      <td class="ro-cell sub-com">214.95</td>
+      <td class="ro-cell sub-com">345.95</td>
       <td class="ro-cell sub-lab">0</td>
       <td class="bonus-cell"><input type="number" step="any" value="0" onchange="S.geralBonus['Sobradinho']=+this.value;renderGeral();salvarAuto()"></td>
-      <td class="geral-total">214.95</td></tr></tbody>
+      <td class="geral-total">345.95</td></tr></tbody>
     </table>
   </div>
   <div class="legenda">
@@ -737,8 +383,7 @@ A <strong>Liga Geral</strong> disputa as <strong>7 unidades</strong> em julho: o
     </div>
   </div>
   <div class="nota-liga">
-Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 01 a 16/07</strong> (S1 e S2).
-    <strong style="color:var(--amarelo)">S3 · 20 a 27/07</strong> é a semana em disputa. O <strong>TOTAL</strong> soma tudo e define a classificação.
+Mês de <strong>julho</strong> (S1, S2 e S3). As colunas S1–S3 mostram só os <strong>critérios apurados</strong> (meta, desconto, campanha, volume). A coluna <strong>Apurado</strong> é a soma deles; <strong style="color:#7dd4a8">Bônus</strong> são os pontos de <strong>desafios</strong> (ex.: 5 Estrelas), lançados à parte. O <strong>TOTAL</strong> soma os dois e define a classificação.
   </div>
   <div class="tbl-wrap">
     <div class="tbl-bar">
@@ -753,7 +398,9 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
         <th style="min-width:110px">Unidade</th>
         <th title="Semana 1">S1</th>
         <th title="Semana 2">S2</th>
-        <th class="th-live" title="Semana 3 — 20 a 27/07 (em disputa)">S3 · 20–27</th>
+        <th class="th-live" title="Semana 3 — 20 a 27/07">S3 · 20–27</th>
+        <th class="th-apurado-col" title="Pontuação apurada (S1+S2+S3)">Apurado</th>
+        <th class="th-bonus-col" title="Bônus de desafios">Bônus</th>
         <th>TOTAL</th>
         <th style="width:30px"></th>
       </tr></thead>
@@ -761,158 +408,210 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
       <td><span class="pos pos-1">1</span></td>
       <td class="td-left"><input type="text" value="GYULIANA" onchange="S.comercial[0].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[0].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="45.43" onchange="S.comercial[0].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="51.72" onchange="S.comercial[0].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[0].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">97.15</td>
+      <td class=""><input type="number" step="any" value="45.43" onchange="S.comercial[0].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="51.72" onchange="S.comercial[0].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="45.73" onchange="S.comercial[0].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">142.88</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.comercial[0].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">148.88</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(0,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-acesso">
       <td><span class="pos pos-2">2</span></td>
-      <td class="td-left"><input type="text" value="MARIANGELA" onchange="S.comercial[1].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[1].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="44.98" onchange="S.comercial[1].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="48.97" onchange="S.comercial[1].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[1].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">93.95</td>
+      <td class="td-left"><input type="text" value="LANE" onchange="S.comercial[1].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[1].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho" selected="">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="42.84" onchange="S.comercial[1].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="47.76" onchange="S.comercial[1].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="48.71" onchange="S.comercial[1].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">139.31</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[1].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">144.31</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(1,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-acesso">
       <td><span class="pos pos-3">3</span></td>
-      <td class="td-left"><input type="text" value="LANE" onchange="S.comercial[2].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[2].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho" selected="">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="42.84" onchange="S.comercial[2].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="47.76" onchange="S.comercial[2].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[2].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">90.6</td>
+      <td class="td-left"><input type="text" value="MARIANGELA" onchange="S.comercial[2].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[2].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="44.98" onchange="S.comercial[2].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="48.97" onchange="S.comercial[2].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="47.84" onchange="S.comercial[2].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">141.79</td>
+      <td class="cell-bonus"><input type="number" step="any" value="0" onchange="S.comercial[2].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">141.79</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(2,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">4</span></td>
       <td class="td-left"><input type="text" value="JESSICA SOARES" onchange="S.comercial[3].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[3].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="43.23" onchange="S.comercial[3].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="43.03" onchange="S.comercial[3].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[3].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">86.26</td>
+      <td class=""><input type="number" step="any" value="43.23" onchange="S.comercial[3].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="43.03" onchange="S.comercial[3].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="43.8" onchange="S.comercial[3].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">130.06</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[3].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">135.06</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(3,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">5</span></td>
       <td class="td-left"><input type="text" value="MARIA CAMILA" onchange="S.comercial[4].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[4].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="38.66" onchange="S.comercial[4].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="44.7" onchange="S.comercial[4].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[4].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">83.36</td>
+      <td class=""><input type="number" step="any" value="38.66" onchange="S.comercial[4].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="44.7" onchange="S.comercial[4].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="45.61" onchange="S.comercial[4].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">128.97</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[4].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">133.97</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(4,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">6</span></td>
-      <td class="td-left"><input type="text" value="GLEY" onchange="S.comercial[5].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[5].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="26.36" onchange="S.comercial[5].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="50.96" onchange="S.comercial[5].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[5].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">77.32</td>
+      <td class="td-left"><input type="text" value="SAMILA" onchange="S.comercial[5].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[5].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="31.46" onchange="S.comercial[5].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="44.84" onchange="S.comercial[5].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="48.66" onchange="S.comercial[5].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">124.96</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[5].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">128.96</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(5,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">7</span></td>
-      <td class="td-left"><input type="text" value="EDUARDO" onchange="S.comercial[6].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[6].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="36.66" onchange="S.comercial[6].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="40.62" onchange="S.comercial[6].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[6].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">77.28</td>
+      <td class="td-left"><input type="text" value="GLEY" onchange="S.comercial[6].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[6].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="26.36" onchange="S.comercial[6].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="50.96" onchange="S.comercial[6].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="45.1" onchange="S.comercial[6].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">122.42</td>
+      <td class="cell-bonus"><input type="number" step="any" value="0" onchange="S.comercial[6].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">122.42</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(6,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">8</span></td>
-      <td class="td-left"><input type="text" value="SAMILA" onchange="S.comercial[7].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[7].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="31.46" onchange="S.comercial[7].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="44.84" onchange="S.comercial[7].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[7].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">76.3</td>
+      <td class="td-left"><input type="text" value="THAMIRES" onchange="S.comercial[7].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[7].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="38.76" onchange="S.comercial[7].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="37.47" onchange="S.comercial[7].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="40.47" onchange="S.comercial[7].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">116.7</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[7].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">121.7</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(7,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">9</span></td>
-      <td class="td-left"><input type="text" value="THAMIRES" onchange="S.comercial[8].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[8].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="38.76" onchange="S.comercial[8].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="37.47" onchange="S.comercial[8].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[8].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">76.23</td>
+      <td class="td-left"><input type="text" value="EDUARDO" onchange="S.comercial[8].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[8].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="36.66" onchange="S.comercial[8].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="40.62" onchange="S.comercial[8].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="38.31" onchange="S.comercial[8].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">115.59</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[8].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">119.59</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(8,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">10</span></td>
       <td class="td-left"><input type="text" value="MIKAEL" onchange="S.comercial[9].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[9].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho" selected="">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="36.55" onchange="S.comercial[9].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="36.39" onchange="S.comercial[9].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[9].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">72.94</td>
+      <td class=""><input type="number" step="any" value="36.55" onchange="S.comercial[9].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="36.39" onchange="S.comercial[9].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="36.28" onchange="S.comercial[9].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">109.22</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[9].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">114.22</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(9,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">11</span></td>
       <td class="td-left"><input type="text" value="MILENA" onchange="S.comercial[10].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[10].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="25.76" onchange="S.comercial[10].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="38.53" onchange="S.comercial[10].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[10].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">64.29</td>
+      <td class=""><input type="number" step="any" value="25.76" onchange="S.comercial[10].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="38.53" onchange="S.comercial[10].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="37.46" onchange="S.comercial[10].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">101.75</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[10].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">106.75</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(10,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">12</span></td>
-      <td class="td-left"><input type="text" value="ANA CAROLINA" onchange="S.comercial[11].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[11].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="34.54" onchange="S.comercial[11].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="28.3" onchange="S.comercial[11].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[11].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">62.84</td>
+      <td class="td-left"><input type="text" value="FRANCISCA" onchange="S.comercial[11].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[11].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="29.51" onchange="S.comercial[11].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="32.65" onchange="S.comercial[11].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="31.59" onchange="S.comercial[11].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">93.75</td>
+      <td class="cell-bonus"><input type="number" step="any" value="0" onchange="S.comercial[11].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">93.75</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(11,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">13</span></td>
-      <td class="td-left"><input type="text" value="FRANCISCA" onchange="S.comercial[12].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[12].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="29.51" onchange="S.comercial[12].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="32.65" onchange="S.comercial[12].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[12].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">62.16</td>
+      <td class="td-left"><input type="text" value="JHONE" onchange="S.comercial[12].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[12].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="26.16" onchange="S.comercial[12].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="28.05" onchange="S.comercial[12].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="31.01" onchange="S.comercial[12].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">85.22</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.comercial[12].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">91.22</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(12,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">14</span></td>
-      <td class="td-left"><input type="text" value="HELAYNE" onchange="S.comercial[13].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[13].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="29.82" onchange="S.comercial[13].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="30.68" onchange="S.comercial[13].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[13].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">60.5</td>
+      <td class="td-left"><input type="text" value="ANA CAROLINA" onchange="S.comercial[13].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[13].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="34.54" onchange="S.comercial[13].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="28.3" onchange="S.comercial[13].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="23.16" onchange="S.comercial[13].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">86</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[13].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">91</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(13,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">15</span></td>
-      <td class="td-left"><input type="text" value="MARIANA" onchange="S.comercial[14].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[14].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="28.24" onchange="S.comercial[14].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="28.03" onchange="S.comercial[14].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[14].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">56.27</td>
+      <td class="td-left"><input type="text" value="BRENO" onchange="S.comercial[14].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[14].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho" selected="">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="17.32" onchange="S.comercial[14].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="34.09" onchange="S.comercial[14].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="31.01" onchange="S.comercial[14].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">82.42</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[14].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">87.42</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(14,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">16</span></td>
-      <td class="td-left"><input type="text" value="JHONE" onchange="S.comercial[15].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[15].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="26.16" onchange="S.comercial[15].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="28.05" onchange="S.comercial[15].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[15].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">54.21</td>
+      <td class="td-left"><input type="text" value="AMANDA" onchange="S.comercial[15].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[15].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="11.2" onchange="S.comercial[15].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.23" onchange="S.comercial[15].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="39.35" onchange="S.comercial[15].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">81.78</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.comercial[15].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">86.78</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(15,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">17</span></td>
-      <td class="td-left"><input type="text" value="BRENO" onchange="S.comercial[16].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[16].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho" selected="">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="17.32" onchange="S.comercial[16].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="34.09" onchange="S.comercial[16].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[16].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">51.41</td>
+      <td class="td-left"><input type="text" value="MARIANA" onchange="S.comercial[16].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[16].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="28.24" onchange="S.comercial[16].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="28.03" onchange="S.comercial[16].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="24.23" onchange="S.comercial[16].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">80.5</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[16].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">84.5</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(16,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">18</span></td>
-      <td class="td-left"><input type="text" value="AMANDA" onchange="S.comercial[17].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[17].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="31.61" onchange="S.comercial[17].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="18.7" onchange="S.comercial[17].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[17].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">50.31</td>
+      <td class="td-left"><input type="text" value="DANI MORAIS" onchange="S.comercial[17].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[17].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="11.2" onchange="S.comercial[17].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="36.34" onchange="S.comercial[17].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="26.64" onchange="S.comercial[17].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">74.18</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[17].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">78.18</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(17,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">19</span></td>
-      <td class="td-left"><input type="text" value="DANI MORAIS" onchange="S.comercial[18].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[18].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="11.2" onchange="S.comercial[18].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="36.34" onchange="S.comercial[18].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[18].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">47.54</td>
+      <td class="td-left"><input type="text" value="HELAYNE" onchange="S.comercial[18].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[18].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="29.82" onchange="S.comercial[18].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="30.68" onchange="S.comercial[18].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="14.4" onchange="S.comercial[18].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">74.9</td>
+      <td class="cell-bonus"><input type="number" step="any" value="0" onchange="S.comercial[18].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">74.9</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(18,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">20</span></td>
       <td class="td-left"><input type="text" value="AMANDA" onchange="S.comercial[19].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[19].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="11.2" onchange="S.comercial[19].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.23" onchange="S.comercial[19].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[19].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">42.43</td>
+      <td><select class="unidade-sel" onchange="S.comercial[19].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1" selected="">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="31.61" onchange="S.comercial[19].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="18.7" onchange="S.comercial[19].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="18.7" onchange="S.comercial[19].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">69.01</td>
+      <td class="cell-bonus"><input type="number" step="any" value="0" onchange="S.comercial[19].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">69.01</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(19,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">21</span></td>
-      <td class="td-left"><input type="text" value="YORRANE" onchange="S.comercial[20].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[20].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="18.5" onchange="S.comercial[20].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="18.5" onchange="S.comercial[20].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[20].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">37</td>
+      <td class="td-left"><input type="text" value="HELEN" onchange="S.comercial[20].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[20].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="14.3" onchange="S.comercial[20].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="14.3" onchange="S.comercial[20].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="30.66" onchange="S.comercial[20].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">59.26</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[20].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">63.26</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(20,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">22</span></td>
-      <td class="td-left"><input type="text" value="HELEN" onchange="S.comercial[21].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[21].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="14.3" onchange="S.comercial[21].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="14.3" onchange="S.comercial[21].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[21].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">28.6</td>
+      <td class="td-left"><input type="text" value="YORRANE" onchange="S.comercial[21].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[21].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="18.5" onchange="S.comercial[21].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="18.5" onchange="S.comercial[21].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="14.4" onchange="S.comercial[21].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">51.4</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.comercial[21].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">57.4</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(21,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">23</span></td>
       <td class="td-left"><input type="text" value="WANESSA" onchange="S.comercial[22].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[22].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="14.4" onchange="S.comercial[22].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="11.2" onchange="S.comercial[22].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[22].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">25.6</td>
+      <td class=""><input type="number" step="any" value="14.4" onchange="S.comercial[22].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="11.2" onchange="S.comercial[22].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="14.3" onchange="S.comercial[22].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">39.9</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[22].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">43.9</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(22,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">24</span></td>
-      <td class="td-left"><input type="text" value="STEFANI" onchange="S.comercial[23].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[23].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="6" onchange="S.comercial[23].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="14.69" onchange="S.comercial[23].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[23].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">20.69</td>
+      <td class="td-left"><input type="text" value="ELANDA" onchange="S.comercial[23].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[23].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="11.1" onchange="S.comercial[23].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="6" onchange="S.comercial[23].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="11.1" onchange="S.comercial[23].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">28.2</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.comercial[23].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">34.2</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(23,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">25</span></td>
-      <td class="td-left"><input type="text" value="ELANDA" onchange="S.comercial[24].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.comercial[24].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="11.1" onchange="S.comercial[24].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="6" onchange="S.comercial[24].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[24].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">17.1</td>
+      <td class="td-left"><input type="text" value="STEFANI" onchange="S.comercial[24].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.comercial[24].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="6" onchange="S.comercial[24].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="14.69" onchange="S.comercial[24].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[24].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">20.69</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[24].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">24.69</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(24,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">26</span></td>
       <td class="td-left"><input type="text" value="MAYCO" onchange="S.comercial[25].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.comercial[25].unidade=this.value;renderLiga('comercial');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
       <td class=""><input type="number" step="any" value="0" onchange="S.comercial[25].s1=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="0" onchange="S.comercial[25].s2=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.comercial[25].s3=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">0</td>
+      <td class="cell-apurado" style="font-weight:600">0</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.comercial[25].bonus=+this.value;renderLiga('comercial');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">4</td>
       <td><button class="btn-danger" onclick="S.comercial.splice(25,1);renderLiga('comercial');renderGeral();salvarAuto()">✕</button></td></tr></tbody>
     </table>
     <div class="add-row">
@@ -938,7 +637,7 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
   </div>
   <div class="nota-liga">
     Pontuação real apurada na planilha da campanha. As colunas <strong>S1 a S4</strong> são os pontos de cada
-<strong>período</strong> apurado. <strong style="color:#7dd4a8">Período apurado: 01 a 16/07</strong> · <strong style="color:var(--amarelo)">S3 · 20 a 27/07</strong> em disputa. O <strong>TOTAL</strong> define a classificação.
+<strong>período</strong> de julho (S1, S2 e S3). As colunas S1–S3 mostram só os <strong>critérios apurados</strong> (fórmulas, ocorrências, coletiva). A coluna <strong>Apurado</strong> soma os critérios; <strong style="color:#7dd4a8">Bônus</strong> são os <strong>desafios</strong>, à parte. O <strong>TOTAL</strong> define a classificação.
     A coluna <strong>Bônus</strong> recebe pontos de desafios extras lançados manualmente.
   </div>
   <div class="tbl-wrap">
@@ -954,7 +653,9 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
         <th style="min-width:110px">Unidade</th>
         <th title="Semana 1">S1</th>
         <th title="Semana 2">S2</th>
-        <th class="th-live" title="Semana 3 — 20 a 27/07 (em disputa)">S3 · 20–27</th>
+        <th class="th-live" title="Semana 3 — 20 a 27/07">S3 · 20–27</th>
+        <th class="th-apurado-col" title="Pontuação apurada (S1+S2+S3)">Apurado</th>
+        <th class="th-bonus-col" title="Bônus de desafios">Bônus</th>
         <th>TOTAL</th>
         <th style="width:30px"></th>
       </tr></thead>
@@ -962,134 +663,178 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
       <td><span class="pos pos-1">1</span></td>
       <td class="td-left"><input type="text" value="MARIA DOS REMEDIOS" onchange="S.lab[0].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[0].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="50.29" onchange="S.lab[0].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="47.3" onchange="S.lab[0].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[0].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">97.59</td>
+      <td class=""><input type="number" step="any" value="50.29" onchange="S.lab[0].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="47.3" onchange="S.lab[0].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="43.1" onchange="S.lab[0].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">140.69</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.lab[0].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">146.69</td>
       <td><button class="btn-danger" onclick="S.lab.splice(0,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-acesso">
       <td><span class="pos pos-2">2</span></td>
       <td class="td-left"><input type="text" value="NEIDE - PESAGEM" onchange="S.lab[1].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[1].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="49.3" onchange="S.lab[1].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="42.61" onchange="S.lab[1].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[1].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">91.91</td>
+      <td class=""><input type="number" step="any" value="49.3" onchange="S.lab[1].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="42.61" onchange="S.lab[1].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="47.89" onchange="S.lab[1].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">139.8</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.lab[1].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">145.8</td>
       <td><button class="btn-danger" onclick="S.lab.splice(1,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-acesso">
       <td><span class="pos pos-3">3</span></td>
-      <td class="td-left"><input type="text" value="TERESA" onchange="S.lab[2].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[2].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="46.79" onchange="S.lab[2].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="43.64" onchange="S.lab[2].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[2].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">90.43</td>
+      <td class="td-left"><input type="text" value="REBEKA" onchange="S.lab[2].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[2].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="44.6" onchange="S.lab[2].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="43.63" onchange="S.lab[2].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="50.83" onchange="S.lab[2].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">139.06</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.lab[2].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">145.06</td>
       <td><button class="btn-danger" onclick="S.lab.splice(2,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">4</span></td>
-      <td class="td-left"><input type="text" value="REBEKA" onchange="S.lab[3].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[3].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="44.6" onchange="S.lab[3].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="43.63" onchange="S.lab[3].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[3].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">88.23</td>
+      <td class="td-left"><input type="text" value="TERESA" onchange="S.lab[3].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[3].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="46.79" onchange="S.lab[3].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="43.64" onchange="S.lab[3].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="47.11" onchange="S.lab[3].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">137.54</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[3].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">141.54</td>
       <td><button class="btn-danger" onclick="S.lab.splice(3,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">5</span></td>
-      <td class="td-left"><input type="text" value="LUCIENE" onchange="S.lab[4].nome=this.value;salvarAuto()"></td>
+      <td class="td-left"><input type="text" value="LUCIANO" onchange="S.lab[4].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[4].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="45.76" onchange="S.lab[4].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="40.03" onchange="S.lab[4].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[4].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">85.79</td>
+      <td class=""><input type="number" step="any" value="51.47" onchange="S.lab[4].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.19" onchange="S.lab[4].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="48.31" onchange="S.lab[4].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">130.97</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[4].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">134.97</td>
       <td><button class="btn-danger" onclick="S.lab.splice(4,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">6</span></td>
-      <td class="td-left"><input type="text" value="MARIA VANESSA - PESAGEM" onchange="S.lab[5].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[5].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="44.72" onchange="S.lab[5].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="38.17" onchange="S.lab[5].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[5].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">82.89</td>
+      <td class="td-left"><input type="text" value="TAIS - PESAGEM" onchange="S.lab[5].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[5].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="53.13" onchange="S.lab[5].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[5].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="54.82" onchange="S.lab[5].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">127.95</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.lab[5].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">133.95</td>
       <td><button class="btn-danger" onclick="S.lab.splice(5,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">7</span></td>
-      <td class="td-left"><input type="text" value="LUCIANO" onchange="S.lab[6].nome=this.value;salvarAuto()"></td>
+      <td class="td-left"><input type="text" value="LUCIENE" onchange="S.lab[6].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[6].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="51.47" onchange="S.lab[6].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.19" onchange="S.lab[6].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[6].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">82.66</td>
+      <td class=""><input type="number" step="any" value="45.76" onchange="S.lab[6].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="40.03" onchange="S.lab[6].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="42.1" onchange="S.lab[6].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">127.89</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[6].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">131.89</td>
       <td><button class="btn-danger" onclick="S.lab.splice(6,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">8</span></td>
-      <td class="td-left"><input type="text" value="YONARA" onchange="S.lab[7].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[7].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="48.94" onchange="S.lab[7].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.89" onchange="S.lab[7].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[7].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">80.83</td>
+      <td class="td-left"><input type="text" value="DAGMAR - PESAGEM" onchange="S.lab[7].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[7].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="40.01" onchange="S.lab[7].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="40.31" onchange="S.lab[7].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="45.65" onchange="S.lab[7].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">125.97</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[7].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">129.97</td>
       <td><button class="btn-danger" onclick="S.lab.splice(7,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">9</span></td>
-      <td class="td-left"><input type="text" value="DAGMAR - PESAGEM" onchange="S.lab[8].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[8].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="40.01" onchange="S.lab[8].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="40.31" onchange="S.lab[8].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[8].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">80.32</td>
+      <td class="td-left"><input type="text" value="DEUZINETE - PESAGEM" onchange="S.lab[8].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[8].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="40.52" onchange="S.lab[8].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="36" onchange="S.lab[8].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="42.1" onchange="S.lab[8].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">118.62</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[8].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">123.62</td>
       <td><button class="btn-danger" onclick="S.lab.splice(8,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">10</span></td>
       <td class="td-left"><input type="text" value="TALIA" onchange="S.lab[9].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[9].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia" selected="">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="36.95" onchange="S.lab[9].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="41.51" onchange="S.lab[9].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[9].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">78.46</td>
+      <td class=""><input type="number" step="any" value="36.95" onchange="S.lab[9].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="41.51" onchange="S.lab[9].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="37.9" onchange="S.lab[9].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">116.36</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[9].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">120.36</td>
       <td><button class="btn-danger" onclick="S.lab.splice(9,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">11</span></td>
-      <td class="td-left"><input type="text" value="GABRIEL" onchange="S.lab[10].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[10].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="29.73" onchange="S.lab[10].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="47.48" onchange="S.lab[10].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[10].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">77.21</td>
+      <td class="td-left"><input type="text" value="MARIA VANESSA - PESAGEM" onchange="S.lab[10].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[10].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="44.72" onchange="S.lab[10].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="38.17" onchange="S.lab[10].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="29.31" onchange="S.lab[10].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">112.2</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[10].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">117.2</td>
       <td><button class="btn-danger" onclick="S.lab.splice(10,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">12</span></td>
-      <td class="td-left"><input type="text" value="DEUZINETE - PESAGEM" onchange="S.lab[11].nome=this.value;salvarAuto()"></td>
+      <td class="td-left"><input type="text" value="YONARA" onchange="S.lab[11].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[11].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="40.52" onchange="S.lab[11].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="36" onchange="S.lab[11].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[11].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">76.52</td>
+      <td class=""><input type="number" step="any" value="48.94" onchange="S.lab[11].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.89" onchange="S.lab[11].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="20" onchange="S.lab[11].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">100.83</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[11].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">105.83</td>
       <td><button class="btn-danger" onclick="S.lab.splice(11,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">13</span></td>
-      <td class="td-left"><input type="text" value="TAIS - PESAGEM" onchange="S.lab[12].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[12].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="53.13" onchange="S.lab[12].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[12].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[12].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">73.13</td>
+      <td class="td-left"><input type="text" value="GABRIEL" onchange="S.lab[12].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[12].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="29.73" onchange="S.lab[12].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="47.48" onchange="S.lab[12].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="20" onchange="S.lab[12].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">97.21</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[12].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">102.21</td>
       <td><button class="btn-danger" onclick="S.lab.splice(12,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">14</span></td>
-      <td class="td-left"><input type="text" value="RAYANNE" onchange="S.lab[13].nome=this.value;salvarAuto()"></td>
+      <td class="td-left"><input type="text" value="MARIA EUNICE" onchange="S.lab[13].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[13].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="46.24" onchange="S.lab[13].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="22" onchange="S.lab[13].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[13].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">68.24</td>
+      <td class=""><input type="number" step="any" value="34.91" onchange="S.lab[13].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="30.17" onchange="S.lab[13].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="28.22" onchange="S.lab[13].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">93.3</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[13].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">98.3</td>
       <td><button class="btn-danger" onclick="S.lab.splice(13,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">15</span></td>
-      <td class="td-left"><input type="text" value="MARIA EUNICE" onchange="S.lab[14].nome=this.value;salvarAuto()"></td>
+      <td class="td-left"><input type="text" value="RAYANNE" onchange="S.lab[14].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[14].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="34.91" onchange="S.lab[14].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="30.17" onchange="S.lab[14].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[14].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">65.08</td>
+      <td class=""><input type="number" step="any" value="46.24" onchange="S.lab[14].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="22" onchange="S.lab[14].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="20" onchange="S.lab[14].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">88.24</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[14].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">93.24</td>
       <td><button class="btn-danger" onclick="S.lab.splice(14,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">16</span></td>
-      <td class="td-left"><input type="text" value="JESSICA" onchange="S.lab[15].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[15].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="22" onchange="S.lab[15].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="38.12" onchange="S.lab[15].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[15].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">60.12</td>
+      <td class="td-left"><input type="text" value="CRISTIANE - PESAGEM" onchange="S.lab[15].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[15].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="37.08" onchange="S.lab[15].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[15].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="28.67" onchange="S.lab[15].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">85.75</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[15].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">89.75</td>
       <td><button class="btn-danger" onclick="S.lab.splice(15,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">17</span></td>
-      <td class="td-left"><input type="text" value="CRISTIANE - PESAGEM" onchange="S.lab[16].nome=this.value;salvarAuto()"></td>
-      <td><select class="unidade-sel" onchange="S.lab[16].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="37.08" onchange="S.lab[16].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[16].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[16].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">57.08</td>
+      <td class="td-left"><input type="text" value="JESSICA" onchange="S.lab[16].nome=this.value;salvarAuto()"></td>
+      <td><select class="unidade-sel" onchange="S.lab[16].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2" selected="">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
+      <td class=""><input type="number" step="any" value="22" onchange="S.lab[16].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="38.12" onchange="S.lab[16].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="20" onchange="S.lab[16].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">80.12</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[16].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">85.12</td>
       <td><button class="btn-danger" onclick="S.lab.splice(16,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">18</span></td>
       <td class="td-left"><input type="text" value="MARIA APARECIDA" onchange="S.lab[17].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[17].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga" selected="">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="15" onchange="S.lab[17].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="37.84" onchange="S.lab[17].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[17].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">52.84</td>
+      <td class=""><input type="number" step="any" value="15" onchange="S.lab[17].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="37.84" onchange="S.lab[17].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="20" onchange="S.lab[17].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">72.84</td>
+      <td class="cell-bonus"><input type="number" step="any" value="5" onchange="S.lab[17].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">77.84</td>
       <td><button class="btn-danger" onclick="S.lab.splice(17,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="">
       <td><span class="pos pos-n">19</span></td>
       <td class="td-left"><input type="text" value="MARIA DE NAZ" onchange="S.lab[18].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[18].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="20" onchange="S.lab[18].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.18" onchange="S.lab[18].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[18].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">51.18</td>
+      <td class=""><input type="number" step="any" value="20" onchange="S.lab[18].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="31.18" onchange="S.lab[18].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="22" onchange="S.lab[18].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">73.18</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[18].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">77.18</td>
       <td><button class="btn-danger" onclick="S.lab.splice(18,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">20</span></td>
       <td class="td-left"><input type="text" value="PATRICIA" onchange="S.lab[19].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[19].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina" selected="">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="23" onchange="S.lab[19].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[19].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[19].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">43</td>
+      <td class=""><input type="number" step="any" value="23" onchange="S.lab[19].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[19].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="23" onchange="S.lab[19].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">66</td>
+      <td class="cell-bonus"><input type="number" step="any" value="6" onchange="S.lab[19].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">72</td>
       <td><button class="btn-danger" onclick="S.lab.splice(19,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">21</span></td>
       <td class="td-left"><input type="text" value="DANIELA - PESAGEM" onchange="S.lab[20].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[20].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="15" onchange="S.lab[20].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="26.72" onchange="S.lab[20].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[20].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">41.72</td>
+      <td class=""><input type="number" step="any" value="15" onchange="S.lab[20].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="26.72" onchange="S.lab[20].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="22" onchange="S.lab[20].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">63.72</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[20].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">67.72</td>
       <td><button class="btn-danger" onclick="S.lab.splice(20,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr><tr class="zona-rebaixamento">
       <td><span class="pos pos-n">22</span></td>
       <td class="td-left"><input type="text" value="FERNANDA - PESAGEM" onchange="S.lab[21].nome=this.value;salvarAuto()"></td>
       <td><select class="unidade-sel" onchange="S.lab[21].unidade=this.value;renderLiga('lab');renderGeral();salvarAuto()"><option value="Asa Sul" selected="">Asa Sul</option><option value="Sobradinho">Sobradinho</option><option value="Planaltina">Planaltina</option><option value="Val 1">Val 1</option><option value="Val 2">Val 2</option><option value="Ceilândia">Ceilândia</option><option value="Taguatinga">Taguatinga</option></select></td>
-      <td class=""><input type="number" step="any" value="20" onchange="S.lab[21].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[21].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="0" onchange="S.lab[21].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
-      <td class="pts-cell">40</td>
+      <td class=""><input type="number" step="any" value="20" onchange="S.lab[21].s1=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class=""><input type="number" step="any" value="20" onchange="S.lab[21].s2=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td><td class="cell-live"><input type="number" step="any" value="22" onchange="S.lab[21].s3=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="cell-apurado" style="font-weight:600">62</td>
+      <td class="cell-bonus"><input type="number" step="any" value="4" onchange="S.lab[21].bonus=+this.value;renderLiga('lab');renderGeral();salvarAuto()"></td>
+      <td class="pts-cell">66</td>
       <td><button class="btn-danger" onclick="S.lab.splice(21,1);renderLiga('lab');renderGeral();salvarAuto()">✕</button></td></tr></tbody>
     </table>
     <div class="add-row">
@@ -1107,16 +852,14 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
   </div>
 
   <!-- DESAFIO ATIVO -->
-  <div class="desafio-card" style="max-width:680px;margin:6px auto 0;background:linear-gradient(160deg,rgba(255,198,0,.16),rgba(0,0,0,.25));border:1px solid rgba(255,198,0,.5);border-radius:16px;padding:26px 24px;">
+  <div class="desafio-card" style="max-width:680px;margin:6px auto 0;background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:26px 24px;opacity:.92;">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-      <span class="de-extra" style="background:#4caf7d;color:#0a3d25;">🟢 DESAFIO ATIVO</span>
-      <span style="font-family:'Oswald',sans-serif;font-size:13px;color:#7dd4a8;letter-spacing:.5px;">📅 20/07 a 27/07</span>
+      <span class="de-extra" style="background:rgba(255,255,255,.15);color:var(--cinza-texto);">✓ CONCLUÍDO</span>
+      <span style="font-family:'Oswald',sans-serif;font-size:13px;color:var(--cinza-texto);letter-spacing:.5px;">📅 20/07 a 27/07</span>
     </div>
-    <div style="font-family:'Oswald',sans-serif;font-size:24px;font-weight:700;color:var(--amarelo);letter-spacing:.5px;margin-bottom:6px;">🌟 Em Busca das 5 Estrelas</div>
+    <div style="font-family:'Oswald',sans-serif;font-size:22px;font-weight:700;color:var(--cinza-texto);letter-spacing:.5px;margin-bottom:6px;">🌟 Em Busca das 5 Estrelas</div>
     <div style="font-size:14px;color:var(--creme);line-height:1.6;margin-bottom:16px;">
-      A nossa torcida são os clientes — e essa semana a missão é <strong>conquistar avaliações 5 estrelas no Google</strong>! 
-      A partir de <strong>8 avaliações</strong> a unidade já pontua, e quanto mais estrelas, mais pontos.
-      <strong style="color:var(--amarelo)">Todo mundo da unidade ganha igual</strong> — comercial e laboratório, o time inteiro joga junto! ⚽
+Desafio encerrado — cada unidade pontuou pelo volume de avaliações 5 estrelas no Google, com todos os membros (comercial e laboratório) ganhando igual. Confira abaixo a tabela de pontuação que valeu.
     </div>
     <table class="criterio-table">
       <tbody><tr><th>Avaliações da unidade na semana</th><th>Cada membro</th><th>Unidade (Liga Geral)</th></tr>
@@ -1128,9 +871,7 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
       <tr><td>20 ou mais</td><td><span class="pts-badge">+5</span></td><td><span class="pts-badge">+30</span></td></tr>
       <tr><td>🏆 Mais avaliações da rede</td><td><span class="pts-badge">+1 extra</span></td><td><span class="pts-badge">+10 extra</span></td></tr>
     </tbody></table>
-    <div style="font-size:12px;color:#a9d8bd;margin-top:12px;background:rgba(76,175,125,.1);border-left:3px solid #4caf7d;border-radius:0 6px 6px 0;padding:8px 12px;">
-      💡 Vale avaliação feita na loja <strong>e online</strong> — então toda unidade pode correr atrás. Peça para quem você atendeu bem: cliente satisfeito adora ajudar!
-    </div>
+    <div style="font-size:11px;color:var(--cinza-texto);margin-top:10px;">A pontuação de cada unidade é lançada no campo <strong>Bônus</strong> dos seus colaboradores.</div>
   </div>
 
   <!-- DESAFIO CONCLUÍDO -->
@@ -1156,14 +897,6 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
     <div style="font-size:11px;color:var(--cinza-texto);margin-top:10px;">Demais participantes ficaram abaixo do mínimo de 2 unidades e não pontuaram nesse desafio.</div>
   </div>
 
-  <!-- PRÓXIMOS (surpresa) -->
-  <div class="teaser-wrap" style="margin-top:22px;">
-    <div class="teaser-card" style="padding:26px 24px;">
-      <div class="teaser-emoji">🎁</div>
-      <div class="teaser-title" style="font-size:20px;">Mais desafios vêm aí…</div>
-      <div class="teaser-text">Outros desafios-surpresa vão aparecer ao longo da Copa Vivenda 2026, podendo valer pontos extras a qualquer momento. Fique atento — quando menos esperar, vale ponto! 👀</div>
-    </div>
-  </div>
 </div>
 
 <!-- ========================= TAB: CRITÉRIOS & DESAFIOS EXTRAS ========================= -->
@@ -1328,7 +1061,7 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
           <th style="width:90px">Bônus</th>
         </tr></thead>
         <tbody>
-          <tr><td class="de-sem">20/07 a 27/07</td><td>🌟 Em Busca das 5 Estrelas <span class="de-extra">ATIVO</span></td><td>Avaliações da unidade no Google (a partir de 8). Todos da unidade pontuam igual.</td><td><span class="pts-badge">+2 até +5</span></td></tr>
+          <tr><td class="de-sem">20/07 a 27/07</td><td>🌟 Em Busca das 5 Estrelas <span class="de-extra" style="background:rgba(255,255,255,.15);color:var(--cinza-texto)">CONCLUÍDO</span></td><td>Avaliações da unidade no Google (a partir de 8). Todos da unidade pontuam igual.</td><td><span class="pts-badge">+2 até +5</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -1350,16 +1083,16 @@ Mês de <strong>julho</strong>. <strong style="color:#7dd4a8">Período apurado: 
    SOMENTE LEITURA — esse é o arquivo que você envia ao GitHub.
    Os campos abaixo são preenchidos automaticamente ao gerar a página.
    ===================================================================== */
-const PUBLISHED_DATA = {"comercial":[{"bge":0,"nome":"GYULIANA","unidade":"Planaltina","s1":45.43,"s2":51.72,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIANGELA","unidade":"Val 1","s1":44.98,"s2":48.97,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"LANE","unidade":"Sobradinho","s1":42.84,"s2":47.76,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"JESSICA SOARES","unidade":"Val 2","s1":43.23,"s2":43.03,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIA CAMILA","unidade":"Taguatinga","s1":38.66,"s2":44.7,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"GLEY","unidade":"Val 1","s1":26.36,"s2":50.96,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"EDUARDO","unidade":"Ceilândia","s1":36.66,"s2":40.62,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"SAMILA","unidade":"Asa Sul","s1":31.46,"s2":44.84,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"THAMIRES","unidade":"Taguatinga","s1":38.76,"s2":37.47,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MIKAEL","unidade":"Sobradinho","s1":36.55,"s2":36.39,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MILENA","unidade":"Taguatinga","s1":25.76,"s2":38.53,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"ANA CAROLINA","unidade":"Val 2","s1":34.54,"s2":28.3,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"FRANCISCA","unidade":"Val 1","s1":29.51,"s2":32.65,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"HELAYNE","unidade":"Val 1","s1":29.82,"s2":30.68,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIANA","unidade":"Asa Sul","s1":28.24,"s2":28.03,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"JHONE","unidade":"Planaltina","s1":26.16,"s2":28.05,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"BRENO","unidade":"Sobradinho","s1":17.32,"s2":34.09,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"AMANDA","unidade":"Val 1","s1":31.61,"s2":18.7,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"DANI MORAIS","unidade":"Ceilândia","s1":11.2,"s2":36.34,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"AMANDA","unidade":"Val 2","s1":11.2,"s2":31.23,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"YORRANE","unidade":"Planaltina","s1":18.5,"s2":18.5,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"HELEN","unidade":"Ceilândia","s1":14.3,"s2":14.3,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"WANESSA","unidade":"Ceilândia","s1":14.4,"s2":11.2,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"STEFANI","unidade":"Asa Sul","s1":6,"s2":14.69,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"ELANDA","unidade":"Planaltina","s1":11.1,"s2":6,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MAYCO","unidade":"Ceilândia","s1":0,"s2":0,"s3":0,"s4":0,"bonus":0}],"lab":[{"bge":0,"nome":"MARIA DOS REMEDIOS","unidade":"Planaltina","s1":50.29,"s2":47.3,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"NEIDE - PESAGEM","unidade":"Planaltina","s1":49.3,"s2":42.61,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"TERESA","unidade":"Ceilândia","s1":46.79,"s2":43.64,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"REBEKA","unidade":"Planaltina","s1":44.6,"s2":43.63,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"LUCIENE","unidade":"Asa Sul","s1":45.76,"s2":40.03,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIA VANESSA - PESAGEM","unidade":"Val 2","s1":44.72,"s2":38.17,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"LUCIANO","unidade":"Asa Sul","s1":51.47,"s2":31.19,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"YONARA","unidade":"Val 2","s1":48.94,"s2":31.89,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"DAGMAR - PESAGEM","unidade":"Asa Sul","s1":40.01,"s2":40.31,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"TALIA","unidade":"Ceilândia","s1":36.95,"s2":41.51,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"GABRIEL","unidade":"Taguatinga","s1":29.73,"s2":47.48,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"DEUZINETE - PESAGEM","unidade":"Val 2","s1":40.52,"s2":36,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"TAIS - PESAGEM","unidade":"Planaltina","s1":53.13,"s2":20,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"RAYANNE","unidade":"Val 2","s1":46.24,"s2":22,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIA EUNICE","unidade":"Val 2","s1":34.91,"s2":30.17,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"JESSICA","unidade":"Val 2","s1":22,"s2":38.12,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"CRISTIANE - PESAGEM","unidade":"Asa Sul","s1":37.08,"s2":20,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIA APARECIDA","unidade":"Taguatinga","s1":15,"s2":37.84,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"MARIA DE NAZ","unidade":"Asa Sul","s1":20,"s2":31.18,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"PATRICIA","unidade":"Planaltina","s1":23,"s2":20,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"DANIELA - PESAGEM","unidade":"Asa Sul","s1":15,"s2":26.72,"s3":0,"s4":0,"bonus":0},{"bge":0,"nome":"FERNANDA - PESAGEM","unidade":"Asa Sul","s1":20,"s2":20,"s3":0,"s4":0,"bonus":0}],"geralBonus":{"Asa Sul":0,"Sobradinho":0,"Planaltina":0,"Val 1":0,"Val 2":0,"Ceilândia":0,"Taguatinga":0}};
+const PUBLISHED_DATA = {"comercial":[{"bge":0,"nome":"GYULIANA","unidade":"Planaltina","s1":45.43,"s2":51.72,"s3":45.73,"s4":0,"bonus":6},{"bge":0,"nome":"LANE","unidade":"Sobradinho","s1":42.84,"s2":47.76,"s3":48.71,"s4":0,"bonus":5},{"bge":0,"nome":"MARIANGELA","unidade":"Val 1","s1":44.98,"s2":48.97,"s3":47.84,"s4":0,"bonus":0},{"bge":0,"nome":"JESSICA SOARES","unidade":"Val 2","s1":43.23,"s2":43.03,"s3":43.8,"s4":0,"bonus":5},{"bge":0,"nome":"MARIA CAMILA","unidade":"Taguatinga","s1":38.66,"s2":44.7,"s3":45.61,"s4":0,"bonus":5},{"bge":0,"nome":"SAMILA","unidade":"Asa Sul","s1":31.46,"s2":44.84,"s3":48.66,"s4":0,"bonus":4},{"bge":0,"nome":"GLEY","unidade":"Val 1","s1":26.36,"s2":50.96,"s3":45.1,"s4":0,"bonus":0},{"bge":0,"nome":"THAMIRES","unidade":"Taguatinga","s1":38.76,"s2":37.47,"s3":40.47,"s4":0,"bonus":5},{"bge":0,"nome":"EDUARDO","unidade":"Ceilândia","s1":36.66,"s2":40.62,"s3":38.31,"s4":0,"bonus":4},{"bge":0,"nome":"MIKAEL","unidade":"Sobradinho","s1":36.55,"s2":36.39,"s3":36.28,"s4":0,"bonus":5},{"bge":0,"nome":"MILENA","unidade":"Taguatinga","s1":25.76,"s2":38.53,"s3":37.46,"s4":0,"bonus":5},{"bge":0,"nome":"FRANCISCA","unidade":"Val 1","s1":29.51,"s2":32.65,"s3":31.59,"s4":0,"bonus":0},{"bge":0,"nome":"JHONE","unidade":"Planaltina","s1":26.16,"s2":28.05,"s3":31.01,"s4":0,"bonus":6},{"bge":0,"nome":"ANA CAROLINA","unidade":"Val 2","s1":34.54,"s2":28.3,"s3":23.16,"s4":0,"bonus":5},{"bge":0,"nome":"BRENO","unidade":"Sobradinho","s1":17.32,"s2":34.09,"s3":31.01,"s4":0,"bonus":5},{"bge":0,"nome":"AMANDA","unidade":"Val 2","s1":11.2,"s2":31.23,"s3":39.35,"s4":0,"bonus":5},{"bge":0,"nome":"MARIANA","unidade":"Asa Sul","s1":28.24,"s2":28.03,"s3":24.23,"s4":0,"bonus":4},{"bge":0,"nome":"DANI MORAIS","unidade":"Ceilândia","s1":11.2,"s2":36.34,"s3":26.64,"s4":0,"bonus":4},{"bge":0,"nome":"HELAYNE","unidade":"Val 1","s1":29.82,"s2":30.68,"s3":14.4,"s4":0,"bonus":0},{"bge":0,"nome":"AMANDA","unidade":"Val 1","s1":31.61,"s2":18.7,"s3":18.7,"s4":0,"bonus":0},{"bge":0,"nome":"HELEN","unidade":"Ceilândia","s1":14.3,"s2":14.3,"s3":30.66,"s4":0,"bonus":4},{"bge":0,"nome":"YORRANE","unidade":"Planaltina","s1":18.5,"s2":18.5,"s3":14.4,"s4":0,"bonus":6},{"bge":0,"nome":"WANESSA","unidade":"Ceilândia","s1":14.4,"s2":11.2,"s3":14.3,"s4":0,"bonus":4},{"bge":0,"nome":"ELANDA","unidade":"Planaltina","s1":11.1,"s2":6,"s3":11.1,"s4":0,"bonus":6},{"bge":0,"nome":"STEFANI","unidade":"Asa Sul","s1":6,"s2":14.69,"s3":0,"s4":0,"bonus":4},{"bge":0,"nome":"MAYCO","unidade":"Ceilândia","s1":0,"s2":0,"s3":0,"s4":0,"bonus":4}],"lab":[{"bge":0,"nome":"MARIA DOS REMEDIOS","unidade":"Planaltina","s1":50.29,"s2":47.3,"s3":43.1,"s4":0,"bonus":6},{"bge":0,"nome":"NEIDE - PESAGEM","unidade":"Planaltina","s1":49.3,"s2":42.61,"s3":47.89,"s4":0,"bonus":6},{"bge":0,"nome":"REBEKA","unidade":"Planaltina","s1":44.6,"s2":43.63,"s3":50.83,"s4":0,"bonus":6},{"bge":0,"nome":"TERESA","unidade":"Ceilândia","s1":46.79,"s2":43.64,"s3":47.11,"s4":0,"bonus":4},{"bge":0,"nome":"LUCIANO","unidade":"Asa Sul","s1":51.47,"s2":31.19,"s3":48.31,"s4":0,"bonus":4},{"bge":0,"nome":"TAIS - PESAGEM","unidade":"Planaltina","s1":53.13,"s2":20,"s3":54.82,"s4":0,"bonus":6},{"bge":0,"nome":"LUCIENE","unidade":"Asa Sul","s1":45.76,"s2":40.03,"s3":42.1,"s4":0,"bonus":4},{"bge":0,"nome":"DAGMAR - PESAGEM","unidade":"Asa Sul","s1":40.01,"s2":40.31,"s3":45.65,"s4":0,"bonus":4},{"bge":0,"nome":"DEUZINETE - PESAGEM","unidade":"Val 2","s1":40.52,"s2":36,"s3":42.1,"s4":0,"bonus":5},{"bge":0,"nome":"TALIA","unidade":"Ceilândia","s1":36.95,"s2":41.51,"s3":37.9,"s4":0,"bonus":4},{"bge":0,"nome":"MARIA VANESSA - PESAGEM","unidade":"Val 2","s1":44.72,"s2":38.17,"s3":29.31,"s4":0,"bonus":5},{"bge":0,"nome":"YONARA","unidade":"Val 2","s1":48.94,"s2":31.89,"s3":20,"s4":0,"bonus":5},{"bge":0,"nome":"GABRIEL","unidade":"Taguatinga","s1":29.73,"s2":47.48,"s3":20,"s4":0,"bonus":5},{"bge":0,"nome":"MARIA EUNICE","unidade":"Val 2","s1":34.91,"s2":30.17,"s3":28.22,"s4":0,"bonus":5},{"bge":0,"nome":"RAYANNE","unidade":"Val 2","s1":46.24,"s2":22,"s3":20,"s4":0,"bonus":5},{"bge":0,"nome":"CRISTIANE - PESAGEM","unidade":"Asa Sul","s1":37.08,"s2":20,"s3":28.67,"s4":0,"bonus":4},{"bge":0,"nome":"JESSICA","unidade":"Val 2","s1":22,"s2":38.12,"s3":20,"s4":0,"bonus":5},{"bge":0,"nome":"MARIA APARECIDA","unidade":"Taguatinga","s1":15,"s2":37.84,"s3":20,"s4":0,"bonus":5},{"bge":0,"nome":"MARIA DE NAZ","unidade":"Asa Sul","s1":20,"s2":31.18,"s3":22,"s4":0,"bonus":4},{"bge":0,"nome":"PATRICIA","unidade":"Planaltina","s1":23,"s2":20,"s3":23,"s4":0,"bonus":6},{"bge":0,"nome":"DANIELA - PESAGEM","unidade":"Asa Sul","s1":15,"s2":26.72,"s3":22,"s4":0,"bonus":4},{"bge":0,"nome":"FERNANDA - PESAGEM","unidade":"Asa Sul","s1":20,"s2":20,"s3":22,"s4":0,"bonus":4}],"geralBonus":{"Asa Sul":0,"Sobradinho":0,"Planaltina":0,"Val 1":0,"Val 2":0,"Ceilândia":0,"Taguatinga":0}};
 const READONLY = true;
 </script>
 
 <script>
 const UNIDADES = ["Asa Sul", "Sobradinho", "Planaltina", "Val 1", "Val 2", "Ceilândia", "Taguatinga"];
-const KEY = 'copa_vivenda_2026_jul_v2';
+const KEY = 'copa_vivenda_2026_jul_v4';
 
 /* Dados reais (planilha de apuração Copa Vivenda 2026) */
-const SEED = {"comercial": [{"nome": "GYULIANA", "unidade": "Planaltina", "s1": 45.43, "s2": 51.72, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIANGELA", "unidade": "Val 1", "s1": 44.98, "s2": 48.97, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "LANE", "unidade": "Sobradinho", "s1": 42.84, "s2": 47.76, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "JESSICA SOARES", "unidade": "Val 2", "s1": 43.23, "s2": 43.03, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIA CAMILA", "unidade": "Taguatinga", "s1": 38.66, "s2": 44.7, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "GLEY", "unidade": "Val 1", "s1": 26.36, "s2": 50.96, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "EDUARDO", "unidade": "Ceilândia", "s1": 36.66, "s2": 40.62, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "SAMILA", "unidade": "Asa Sul", "s1": 31.46, "s2": 44.84, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "THAMIRES", "unidade": "Taguatinga", "s1": 38.76, "s2": 37.47, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MIKAEL", "unidade": "Sobradinho", "s1": 36.55, "s2": 36.39, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MILENA", "unidade": "Taguatinga", "s1": 25.76, "s2": 38.53, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "ANA CAROLINA", "unidade": "Val 2", "s1": 34.54, "s2": 28.3, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "FRANCISCA", "unidade": "Val 1", "s1": 29.51, "s2": 32.65, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "HELAYNE", "unidade": "Val 1", "s1": 29.82, "s2": 30.68, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIANA", "unidade": "Asa Sul", "s1": 28.24, "s2": 28.03, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "JHONE", "unidade": "Planaltina", "s1": 26.16, "s2": 28.05, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "BRENO", "unidade": "Sobradinho", "s1": 17.32, "s2": 34.09, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "AMANDA", "unidade": "Val 1", "s1": 31.61, "s2": 18.7, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "DANI MORAIS", "unidade": "Ceilândia", "s1": 11.2, "s2": 36.34, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "AMANDA", "unidade": "Val 2", "s1": 11.2, "s2": 31.23, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "YORRANE", "unidade": "Planaltina", "s1": 18.5, "s2": 18.5, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "HELEN", "unidade": "Ceilândia", "s1": 14.3, "s2": 14.3, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "WANESSA", "unidade": "Ceilândia", "s1": 14.4, "s2": 11.2, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "STEFANI", "unidade": "Asa Sul", "s1": 6.0, "s2": 14.69, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "ELANDA", "unidade": "Planaltina", "s1": 11.1, "s2": 6.0, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MAYCO", "unidade": "Ceilândia", "s1": 0.0, "s2": 0.0, "s3": 0.0, "s4": 0, "bonus": 0}], "lab": [{"nome": "MARIA DOS REMEDIOS", "unidade": "Planaltina", "s1": 50.29, "s2": 47.3, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "NEIDE - PESAGEM", "unidade": "Planaltina", "s1": 49.3, "s2": 42.61, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "TERESA", "unidade": "Ceilândia", "s1": 46.79, "s2": 43.64, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "REBEKA", "unidade": "Planaltina", "s1": 44.6, "s2": 43.63, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "LUCIENE", "unidade": "Asa Sul", "s1": 45.76, "s2": 40.03, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIA VANESSA - PESAGEM", "unidade": "Val 2", "s1": 44.72, "s2": 38.17, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "LUCIANO", "unidade": "Asa Sul", "s1": 51.47, "s2": 31.19, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "YONARA", "unidade": "Val 2", "s1": 48.94, "s2": 31.89, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "DAGMAR - PESAGEM", "unidade": "Asa Sul", "s1": 40.01, "s2": 40.31, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "TALIA", "unidade": "Ceilândia", "s1": 36.95, "s2": 41.51, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "GABRIEL", "unidade": "Taguatinga", "s1": 29.73, "s2": 47.48, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "DEUZINETE - PESAGEM", "unidade": "Val 2", "s1": 40.52, "s2": 36.0, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "TAIS - PESAGEM", "unidade": "Planaltina", "s1": 53.13, "s2": 20.0, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "RAYANNE", "unidade": "Val 2", "s1": 46.24, "s2": 22.0, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIA EUNICE", "unidade": "Val 2", "s1": 34.91, "s2": 30.17, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "JESSICA", "unidade": "Val 2", "s1": 22.0, "s2": 38.12, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "CRISTIANE - PESAGEM", "unidade": "Asa Sul", "s1": 37.08, "s2": 20.0, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIA APARECIDA", "unidade": "Taguatinga", "s1": 15.0, "s2": 37.84, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "MARIA DE NAZ", "unidade": "Asa Sul", "s1": 20.0, "s2": 31.18, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "PATRICIA", "unidade": "Planaltina", "s1": 23.0, "s2": 20.0, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "DANIELA - PESAGEM", "unidade": "Asa Sul", "s1": 15.0, "s2": 26.72, "s3": 0.0, "s4": 0, "bonus": 0}, {"nome": "FERNANDA - PESAGEM", "unidade": "Asa Sul", "s1": 20.0, "s2": 20.0, "s3": 0.0, "s4": 0, "bonus": 0}], "geralBonus": {"Asa Sul": 0, "Sobradinho": 0, "Planaltina": 0, "Val 1": 0, "Val 2": 0, "Ceilândia": 0, "Taguatinga": 0}};
+const SEED = {"comercial": [{"nome": "GYULIANA", "unidade": "Planaltina", "s1": 45.43, "s2": 51.72, "s3": 45.73, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "LANE", "unidade": "Sobradinho", "s1": 42.84, "s2": 47.76, "s3": 48.71, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MARIANGELA", "unidade": "Val 1", "s1": 44.98, "s2": 48.97, "s3": 47.84, "s4": 0, "bonus": 0, "bge": 0}, {"nome": "JESSICA SOARES", "unidade": "Val 2", "s1": 43.23, "s2": 43.03, "s3": 43.8, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MARIA CAMILA", "unidade": "Taguatinga", "s1": 38.66, "s2": 44.7, "s3": 45.61, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "SAMILA", "unidade": "Asa Sul", "s1": 31.46, "s2": 44.84, "s3": 48.66, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "GLEY", "unidade": "Val 1", "s1": 26.36, "s2": 50.96, "s3": 45.1, "s4": 0, "bonus": 0, "bge": 0}, {"nome": "THAMIRES", "unidade": "Taguatinga", "s1": 38.76, "s2": 37.47, "s3": 40.47, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "EDUARDO", "unidade": "Ceilândia", "s1": 36.66, "s2": 40.62, "s3": 38.31, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "MIKAEL", "unidade": "Sobradinho", "s1": 36.55, "s2": 36.39, "s3": 36.28, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MILENA", "unidade": "Taguatinga", "s1": 25.76, "s2": 38.53, "s3": 37.46, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "FRANCISCA", "unidade": "Val 1", "s1": 29.51, "s2": 32.65, "s3": 31.59, "s4": 0, "bonus": 0, "bge": 0}, {"nome": "JHONE", "unidade": "Planaltina", "s1": 26.16, "s2": 28.05, "s3": 31.01, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "ANA CAROLINA", "unidade": "Val 2", "s1": 34.54, "s2": 28.3, "s3": 23.16, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "BRENO", "unidade": "Sobradinho", "s1": 17.32, "s2": 34.09, "s3": 31.01, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "AMANDA", "unidade": "Val 2", "s1": 11.2, "s2": 31.23, "s3": 39.35, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MARIANA", "unidade": "Asa Sul", "s1": 28.24, "s2": 28.03, "s3": 24.23, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "DANI MORAIS", "unidade": "Ceilândia", "s1": 11.2, "s2": 36.34, "s3": 26.64, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "HELAYNE", "unidade": "Val 1", "s1": 29.82, "s2": 30.68, "s3": 14.4, "s4": 0, "bonus": 0, "bge": 0}, {"nome": "AMANDA", "unidade": "Val 1", "s1": 31.61, "s2": 18.7, "s3": 18.7, "s4": 0, "bonus": 0, "bge": 0}, {"nome": "HELEN", "unidade": "Ceilândia", "s1": 14.3, "s2": 14.3, "s3": 30.66, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "YORRANE", "unidade": "Planaltina", "s1": 18.5, "s2": 18.5, "s3": 14.4, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "WANESSA", "unidade": "Ceilândia", "s1": 14.4, "s2": 11.2, "s3": 14.3, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "ELANDA", "unidade": "Planaltina", "s1": 11.1, "s2": 6, "s3": 11.1, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "STEFANI", "unidade": "Asa Sul", "s1": 6, "s2": 14.69, "s3": 0, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "MAYCO", "unidade": "Ceilândia", "s1": 0, "s2": 0, "s3": 0, "s4": 0, "bonus": 4, "bge": 0}], "lab": [{"nome": "MARIA DOS REMEDIOS", "unidade": "Planaltina", "s1": 50.29, "s2": 47.3, "s3": 43.1, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "NEIDE - PESAGEM", "unidade": "Planaltina", "s1": 49.3, "s2": 42.61, "s3": 47.89, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "REBEKA", "unidade": "Planaltina", "s1": 44.6, "s2": 43.63, "s3": 50.83, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "TERESA", "unidade": "Ceilândia", "s1": 46.79, "s2": 43.64, "s3": 47.11, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "LUCIANO", "unidade": "Asa Sul", "s1": 51.47, "s2": 31.19, "s3": 48.31, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "TAIS - PESAGEM", "unidade": "Planaltina", "s1": 53.13, "s2": 20, "s3": 54.82, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "LUCIENE", "unidade": "Asa Sul", "s1": 45.76, "s2": 40.03, "s3": 42.1, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "DAGMAR - PESAGEM", "unidade": "Asa Sul", "s1": 40.01, "s2": 40.31, "s3": 45.65, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "DEUZINETE - PESAGEM", "unidade": "Val 2", "s1": 40.52, "s2": 36, "s3": 42.1, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "TALIA", "unidade": "Ceilândia", "s1": 36.95, "s2": 41.51, "s3": 37.9, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "MARIA VANESSA - PESAGEM", "unidade": "Val 2", "s1": 44.72, "s2": 38.17, "s3": 29.31, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "YONARA", "unidade": "Val 2", "s1": 48.94, "s2": 31.89, "s3": 20, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "GABRIEL", "unidade": "Taguatinga", "s1": 29.73, "s2": 47.48, "s3": 20, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MARIA EUNICE", "unidade": "Val 2", "s1": 34.91, "s2": 30.17, "s3": 28.22, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "RAYANNE", "unidade": "Val 2", "s1": 46.24, "s2": 22, "s3": 20, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "CRISTIANE - PESAGEM", "unidade": "Asa Sul", "s1": 37.08, "s2": 20, "s3": 28.67, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "JESSICA", "unidade": "Val 2", "s1": 22, "s2": 38.12, "s3": 20, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MARIA APARECIDA", "unidade": "Taguatinga", "s1": 15, "s2": 37.84, "s3": 20, "s4": 0, "bonus": 5, "bge": 0}, {"nome": "MARIA DE NAZ", "unidade": "Asa Sul", "s1": 20, "s2": 31.18, "s3": 22, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "PATRICIA", "unidade": "Planaltina", "s1": 23, "s2": 20, "s3": 23, "s4": 0, "bonus": 6, "bge": 0}, {"nome": "DANIELA - PESAGEM", "unidade": "Asa Sul", "s1": 15, "s2": 26.72, "s3": 22, "s4": 0, "bonus": 4, "bge": 0}, {"nome": "FERNANDA - PESAGEM", "unidade": "Asa Sul", "s1": 20, "s2": 20, "s3": 22, "s4": 0, "bonus": 4, "bge": 0}], "geralBonus": {"Asa Sul": 0, "Sobradinho": 0, "Planaltina": 0, "Val 1": 0, "Val 2": 0, "Ceilândia": 0, "Taguatinga": 0}};
 
 let S = { comercial:[], lab:[], geralBonus:{} };
 
@@ -1368,13 +1101,14 @@ function mkL(nome,unidade) { return {nome, unidade:unidade||UNIDADES[0], s1:0,s2
 
 /* Laboratórios compartilhados: a unidade SEM lab próprio usa o lab de uma vizinha
    (e esse lab continua contando também para a unidade de origem). */
-/* Laboratórios compartilhados DESLIGADOS por enquanto (reativar mês que vem):
+/* Laboratórios compartilhados DESLIGADOS por enquanto (rever forma de apuração):
    const LAB_SOURCE = { 'Sobradinho':'Planaltina', 'Val 1':'Val 2' }; */
 const LAB_SOURCE = {};
 
 function fmt(n) { return Math.round((Number(n)+Number.EPSILON)*100)/100; }
-function totalC(r) { return (r.s1||0)+(r.s2||0)+(r.s3||0)+(r.s4||0)+(r.bonus||0); }
-function totalL(r) { return (r.s1||0)+(r.s2||0)+(r.s3||0)+(r.s4||0)+(r.bonus||0); }
+function apur(r) { return (r.s1||0)+(r.s2||0)+(r.s3||0)+(r.s4||0); }   // pontuação apurada (comercial/lab)
+function totalC(r) { return apur(r)+(r.bonus||0); }
+function totalL(r) { return apur(r)+(r.bonus||0); }
 
 function ensureBonus() {
   if(!S.geralBonus) S.geralBonus = {};
@@ -1404,7 +1138,7 @@ function aggregateGeral() {
   S.comercial.forEach(r=>{ if(com[r.unidade]!=null) com[r.unidade] += totalC(r); });
   S.lab.forEach(r=>{ if(labOwn[r.unidade]!=null) labOwn[r.unidade] += totalL(r); });
   const arr = UNIDADES.map(u=>{
-    const labFonte = LAB_SOURCE[u] || u;        // unidade sem lab usa o da vizinha
+    const labFonte = LAB_SOURCE[u] || u;        // unidade sem lab usa o da vizinha (total cheio)
     return { unidade:u, com:com[u], lab:labOwn[labFonte],
              labCompart:(LAB_SOURCE[u]||null), bonus:(S.geralBonus[u]||0) };
   });
@@ -1443,6 +1177,8 @@ function renderLiga(liga) {
       <td class="td-left"><input type="text" value="${esc(r.nome)}" onchange="S.${liga}[${i}].nome=this.value;salvarAuto()"/></td>
       <td><select class="unidade-sel" onchange="S.${liga}[${i}].unidade=this.value;renderLiga('${liga}');renderGeral();salvarAuto()">${unidadeOptions(r.unidade)}</select></td>
       ${wkc('s1','')}${wkc('s2','')}${wkc('s3','cell-live')}
+      <td class="cell-apurado" style="font-weight:600">${fmt(apur(r))}</td>
+      ${wkc('bonus','cell-bonus')}
       <td class="pts-cell">${t}</td>
       <td><button class="btn-danger" onclick="S.${liga}.splice(${i},1);renderLiga('${liga}');renderGeral();salvarAuto()">✕</button></td>`;
     tb.appendChild(tr);
